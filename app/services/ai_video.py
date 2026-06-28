@@ -2,7 +2,7 @@
 AI Video Generation Service
 
 Provider abstraction for generating videos from images (image-to-video) or text.
-Supports: Kling (direct), fal.ai (Kling proxy), and extensible for Runway, Pika, Luma, etc.
+Supports: Kling (direct), fal.ai, deAPI, and extensible for Runway, Pika, Luma, etc.
 
 Usage:
     from app.services.ai_video import generate_video_from_image, generate_videos_for_scenes
@@ -474,6 +474,146 @@ def fal_image_to_video(
     return _fal_submit_and_poll(endpoint, payload, save_path)
 
 
+# ─── deAPI.ai Provider ───────────────────────────────────────────────
+
+def _get_deapi_key() -> str:
+    """Get deAPI.ai API key."""
+    key = config.app.get("deapi_key", "").strip()
+    if not key:
+        raise ValueError(
+            "deAPI.ai key not configured. Set deapi_key in config.toml "
+            "(get it at https://app.deapi.ai/register for $5 free)"
+        )
+    return key
+
+
+def _deapi_headers() -> dict:
+    return {"Authorization": f"Bearer {_get_deapi_key()}"}
+
+
+import io as _io
+
+
+def deapi_image_to_video(
+    image_path: str,
+    prompt: str,
+    save_path: str,
+    model: str = "Ltxv_13B_0_9_8_Distilled_FP8",
+    width: int = 512,
+    height: int = 512,
+    frames: int = 50,
+    fps: int = 8,
+    steps: int = 20,
+    guidance: float = 7.5,
+    max_wait: int = 900,
+) -> str:
+    """
+    Generate video from image using deAPI.ai.
+
+    Uses LTX-2.3 open source model (good quality, cheap).
+    API: POST /api/v2/videos/animations → multipart form data
+    Polling: GET /api/v2/jobs/{request_id}
+    Result: {status, output: {video_url, ...}}
+    """
+    headers = _deapi_headers()
+
+    try:
+        # Step 1: Submit job via multipart
+        with open(image_path, "rb") as f:
+            img_data = f.read()
+
+        ext = os.path.splitext(image_path)[1].lstrip(".")
+        filename = f"frame.{ext}"
+        content_type = f"image/{ext}" if ext else "image/png"
+
+        files = {
+            "first_frame_image": (filename, _io.BytesIO(img_data), content_type),
+            "prompt": (None, prompt[:1000]),
+            "model": (None, model),
+            "width": (None, str(width)),
+            "height": (None, str(height)),
+            "frames": (None, str(frames)),
+            "fps": (None, str(fps)),
+            "steps": (None, str(steps)),
+            "guidance": (None, str(guidance)),
+            "seed": (None, str(-1)),
+        }
+
+        logger.info(f"deAPI submit: model={model}, {width}x{height}, {frames}fr@{fps}fps")
+        resp = requests.post(
+            "https://api.deapi.ai/api/v2/videos/animations",
+            headers=headers,
+            files=files,
+            timeout=(30, 60),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        request_id = data.get("request_id", "")
+        if not request_id:
+            logger.error(f"deAPI: no request_id in response: {data}")
+            return ""
+
+        logger.info(f"deAPI task: {request_id}")
+
+        # Step 2: Poll for result
+        elapsed = 0
+        while elapsed < max_wait:
+            try:
+                poll_resp = requests.get(
+                    f"https://api.deapi.ai/api/v2/jobs/{request_id}",
+                    headers=headers,
+                    timeout=30,
+                )
+                poll_resp.raise_for_status()
+                status_data = poll_resp.json()
+                status = status_data.get("status", "").lower()
+
+                logger.info(f"deAPI job {request_id}: {status} ({elapsed}s)")
+
+                if status in ("completed", "succeeded"):
+                    # Get video URL
+                    output = status_data.get("output", {}) or {}
+                    video_url = output.get("video_url", "")
+                    if not video_url:
+                        # Try other response shapes
+                        video_url = status_data.get("video_url", "")
+                    if not video_url:
+                        for k in ["url", "video_url", "download_url"]:
+                            item = output.get(k, "")
+                            if item:
+                                video_url = item
+                                break
+
+                    if video_url:
+                        logger.info(f"deAPI: downloading video from {video_url[:80]}...")
+                        return _download_video(video_url, save_path)
+                    else:
+                        logger.error(f"deAPI: no video URL in result")
+                        logger.debug(f"deAPI result: {status_data}")
+                        return ""
+
+                elif status in ("failed", "error"):
+                    err = status_data.get("error", status_data.get("message", "unknown"))
+                    logger.error(f"deAPI job failed: {err}")
+                    return ""
+
+                time.sleep(5)
+                elapsed += 5
+
+            except Exception as e:
+                logger.warning(f"deAPI poll error: {e}")
+                time.sleep(10)
+                elapsed += 10
+
+        logger.error(f"deAPI task timed out after {max_wait}s")
+        return ""
+
+    except Exception as e:
+        logger.error(f"deAPI request failed: {e}")
+        return ""
+
+
 # ─── Public API ────────────────────────────────────────────────────────
 
 def generate_video_from_image(
@@ -495,7 +635,7 @@ def generate_video_from_image(
         duration: Target duration (5 or 10 seconds for Kling)
         mode: Quality mode ("std" or "pro")
         aspect_ratio: "9:16", "16:9", "1:1"
-        provider: Override provider ("kling", "fal", "runway", "pika")
+        provider: Override provider ("kling", "fal", "deapi", "runway", "pika")
 
     Returns:
         Path to saved video, or empty string on failure
@@ -506,6 +646,8 @@ def generate_video_from_image(
         return kling_image_to_video(image_path, prompt, save_path, duration, mode, aspect_ratio)
     elif provider == "fal":
         return fal_image_to_video(image_path, prompt, save_path, duration)
+    elif provider == "deapi":
+        return deapi_image_to_video(image_path, prompt, save_path)
     elif provider == "runway":
         # TODO: implement Runway provider
         logger.error("Runway provider not yet implemented")

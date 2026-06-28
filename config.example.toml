@@ -452,7 +452,7 @@ ai_scene_count = 6
 ai_prompt_language = "en"
 
 # ─── AI Video Generation ───────────────────────────────────────────
-# Provider: kling (klingai.com), fal (fal.ai), runway (TODO), pika (TODO)
+# Provider: kling (klingai.com), fal (fal.ai), deapi (deapi.ai), runway (TODO), pika (TODO)
 ai_video_provider = "kling"
 kling_model_name = "kling-v3"
 kling_mode = "std"  # std or pro
@@ -472,3 +472,11 @@ fal_key = ""
 fal_image_model = "fal-ai/flux/schnell"  # $0.003/image
 # Kling model on fal.ai (used when ai_video_provider="fal")
 fal_kling_model = "kling-std"
+
+# ─── deAPI.ai Provider ──────────────────────────────────────────────
+# Decentralized GPU network, cheap open-source models.
+# $5 free credits on signup at https://app.deapi.ai/register
+deapi_key = ""
+# Model: Ltxv_13B_0_9_8_Distilled_FP8 (LTX-2.3, good quality)
+# Other models: list via GET /api/v2/models
+deapi_model = "Ltxv_13B_0_9_8_Distilled_FP8"

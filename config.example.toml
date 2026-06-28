@@ -439,3 +439,24 @@ api_key = ""
 model_id = "chatterbox"
 # Voices exposed by your server; shown in the WebUI dropdown as chatterbox:<name>
 voices = ["default-Female"]
+
+[app]
+# ─── AI Image Generation (video_source = "ai_generate") ────────────
+# Provider: pollinations (FREE, no key needed), dalle (needs openai_api_key)
+ai_image_provider = "pollinations"
+# Default visual style prepended to every image prompt
+ai_image_style = "cartoon style, colorful, simple shapes, flat design"
+# Number of scenes (clips) to generate
+ai_scene_count = 6
+# Language for LLM scene prompts; "en", "ru", "zh"
+ai_prompt_language = "en"
+
+# ─── AI Video Generation ───────────────────────────────────────────
+# Provider: kling (klingai.com), runway (TODO), pika (TODO)
+ai_video_provider = "kling"
+kling_model_name = "kling-v3"
+kling_mode = "std"  # std or pro
+kling_base_url = "https://api.klingai.com"
+# Sign up at https://klingai.com → Account Settings → API Keys
+kling_access_key = ""
+kling_secret_key = ""

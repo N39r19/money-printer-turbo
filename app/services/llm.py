@@ -1117,6 +1117,101 @@ def generate_social_metadata(
     return _fallback_social_metadata(video_subject, video_script, platform)
 
 
+def generate_scene_prompts(
+    video_subject: str,
+    video_script: str,
+    scene_count: int = 6,
+    style: str = "",
+    language: str = "",
+) -> dict:
+    """
+    Generate image prompts and motion prompts for each scene of a video.
+
+    Uses the LLM to split the script into scenes, then create:
+    - image_prompt: visual description for AI image generation
+    - motion_prompt: camera/motion description for AI video generation (image-to-video)
+
+    Args:
+        video_subject: Main topic of the video
+        video_script: Full video script/narration
+        scene_count: Number of scenes to split into
+        style: Visual style hint (e.g., "cartoon style, vibrant colors")
+        language: Target language for prompts (en, ru, zh)
+
+    Returns:
+        Dict with keys:
+            - "image_prompts": List[str] - one per scene
+            - "motion_prompts": List[str] - one per scene
+            - "scenes": List[str] - script text per scene
+    """
+    style_instruction = f"\n- Visual style: {style}" if style else ""
+    lang_instruction = f"\n- Write all prompts in {language}" if language else "\n- Write all prompts in English"
+
+    prompt = f"""You are a video director. Split the following video script into exactly {scene_count} scenes.
+For each scene, provide:
+
+1. "scene_text": The narration text for this scene (from the script)
+2. "image_prompt": A detailed visual description for AI image generation. Describe the scene visually — characters, setting, lighting, mood, composition. Be specific and descriptive.
+3. "motion_prompt": Camera and motion instructions for animating this image. Describe what moves, camera movement (pan, zoom, tilt), and any environmental motion (wind, rain, etc.).
+
+Return ONLY valid JSON, no markdown fences, no explanation.
+
+Format:
+{{
+  "scenes": [
+    {{
+      "scene_text": "...",
+      "image_prompt": "...",
+      "motion_prompt": "..."
+    }}
+  ]
+}}
+
+Rules:
+- Exactly {scene_count} scenes
+- Split the script evenly across scenes
+- Each image_prompt should be a complete, standalone visual description{style_instruction}{lang_instruction}
+- Each motion_prompt should be concise (1-2 sentences)
+- Do NOT include the scene number or labels in the prompts
+
+Video subject: {video_subject}
+Video script:
+{video_script}"""
+
+    logger.info(f"generating {scene_count} scene prompts for: {video_subject}")
+
+    for i in range(_max_retries):
+        try:
+            response = _generate_response(prompt=prompt)
+            if not response or "Error: " in response:
+                logger.warning(f"scene prompt generation attempt {i+1} failed")
+                continue
+
+            cleaned = _strip_code_fence(response)
+            data = json.loads(cleaned)
+
+            scenes = data.get("scenes", [])
+            if not scenes:
+                logger.warning("no scenes in response")
+                continue
+
+            image_prompts = [s.get("image_prompt", "") for s in scenes]
+            motion_prompts = [s.get("motion_prompt", "") for s in scenes]
+            scene_texts = [s.get("scene_text", "") for s in scenes]
+
+            logger.success(f"generated {len(scenes)} scene prompts")
+            return {
+                "image_prompts": image_prompts,
+                "motion_prompts": motion_prompts,
+                "scenes": scene_texts,
+            }
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"failed to parse scene prompts (attempt {i+1}): {e}")
+
+    logger.error("failed to generate scene prompts after all retries")
+    return {"image_prompts": [], "motion_prompts": [], "scenes": []}
+
+
 if __name__ == "__main__":
     video_subject = "生命的意义是什么"
     script = generate_script(

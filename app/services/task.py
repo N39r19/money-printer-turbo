@@ -10,6 +10,7 @@ from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import llm, material, subtitle, twelvelabs, video, voice, upload_post
 from app.services import state as sm
+from app.services import ai_image, ai_video
 from app.utils import file_security, utils
 
 
@@ -223,6 +224,104 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
+def get_ai_video_materials(task_id, params, audio_duration):
+    """
+    Generate video materials using AI image generation + AI video generation.
+    Replaces stock footage with AI-generated content.
+
+    Pipeline: script → scene prompts (LLM) → images (AI) → videos (AI image-to-video)
+    """
+    from app.config import config
+
+    # Determine scene count from script paragraphs or config
+    scene_count = config.app.get("ai_scene_count", 6)
+    visual_style = config.app.get("ai_image_style", "")
+    image_provider = config.app.get("ai_image_provider", "pollinations")
+    video_provider = config.app.get("ai_video_provider", "kling")
+
+    # Calculate per-clip duration based on total audio duration
+    per_clip_duration = int(audio_duration / scene_count)
+    per_clip_duration = max(5, min(10, per_clip_duration))  # Kling supports 5 or 10
+
+    # Get the script — we need it for scene generation
+    import json as _json
+    script_file = os.path.join(utils.task_dir(task_id), "script.json")
+    video_script = ""
+    if os.path.exists(script_file):
+        with open(script_file, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+            video_script = data.get("script", "").strip()
+
+    if not video_script:
+        # Fallback: use video_subject
+        video_script = params.video_subject or "a short story"
+
+    video_subject = params.video_subject or ""
+    language = config.app.get("ai_prompt_language", "en")
+
+    logger.info(
+        f"\n\n## AI generate mode: {scene_count} scenes, "
+        f"image={image_provider}, video={video_provider}, "
+        f"per_clip={per_clip_duration}s"
+    )
+
+    # Step 1: Generate scene prompts (image + motion) using LLM
+    logger.info("## step 1: generating scene prompts")
+    scene_data = llm.generate_scene_prompts(
+        video_subject=video_subject,
+        video_script=video_script,
+        scene_count=scene_count,
+        style=visual_style,
+        language=language,
+    )
+
+    if not scene_data["image_prompts"]:
+        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        logger.error("failed to generate scene prompts")
+        return None
+
+    # Step 2: Generate images for each scene
+    logger.info(f"## step 2: generating {len(scene_data['image_prompts'])} images")
+    aspect = params.video_aspect if hasattr(params, "video_aspect") else "9:16"
+    width, height = 1080, 1920
+    if aspect == "16:9":
+        width, height = 1920, 1080
+    elif aspect == "1:1":
+        width, height = 1080, 1080
+
+    image_paths = ai_image.generate_images_for_scenes(
+        task_id=task_id,
+        image_prompts=scene_data["image_prompts"],
+        width=width,
+        height=height,
+        style_prompt=visual_style,
+    )
+
+    if not image_paths:
+        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        logger.error("failed to generate scene images")
+        return None
+
+    # Step 3: Generate videos from images (image-to-video)
+    logger.info(f"## step 3: generating {len(image_paths)} videos")
+    video_paths = ai_video.generate_videos_for_scenes(
+        task_id=task_id,
+        image_paths=image_paths,
+        motion_prompts=scene_data["motion_prompts"][:len(image_paths)],
+        duration=per_clip_duration,
+        mode=config.app.get("kling_mode", "std"),
+        aspect_ratio=aspect,
+    )
+
+    if not video_paths:
+        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        logger.error("failed to generate AI videos")
+        return None
+
+    logger.success(f"## AI materials ready: {len(video_paths)} clips")
+    return video_paths
+
+
 def get_video_materials(task_id, params, video_terms, audio_duration):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
@@ -236,6 +335,10 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             )
             return None
         return [material_info.url for material_info in materials]
+
+    elif params.video_source == "ai_generate":
+        return get_ai_video_materials(task_id, params, audio_duration)
+
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序

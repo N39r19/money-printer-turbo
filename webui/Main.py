@@ -889,6 +889,7 @@ with middle_panel:
             (tr("Pexels"), "pexels"),
             (tr("Pixabay"), "pixabay"),
             (tr("Coverr"), "coverr"),
+            (tr("AI Generated"), "ai_generate"),
             (tr("Local file"), "local"),
             (tr("TikTok"), "douyin"),
             (tr("Bilibili"), "bilibili"),
@@ -896,7 +897,10 @@ with middle_panel:
         ]
 
         saved_video_source_name = config.app.get("video_source", "pexels")
-        saved_video_source_index = [v[1] for v in video_sources].index(
+        saved_video_source_names = [v[1] for v in video_sources]
+        if saved_video_source_name not in saved_video_source_names:
+            saved_video_source_name = "pexels"
+        saved_video_source_index = saved_video_source_names.index(
             saved_video_source_name
         )
 
@@ -1676,7 +1680,7 @@ if start_button:
         scroll_to_bottom()
         st.stop()
 
-    if params.video_source not in ["pexels", "pixabay", "coverr", "local"]:
+    if params.video_source not in ["pexels", "pixabay", "coverr", "local", "ai_generate"]:
         st.error(tr("Please Select a Valid Video Source"))
         scroll_to_bottom()
         st.stop()

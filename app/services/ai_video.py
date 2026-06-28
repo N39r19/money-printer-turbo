@@ -2,7 +2,7 @@
 AI Video Generation Service
 
 Provider abstraction for generating videos from images (image-to-video) or text.
-Supports: Kling, and extensible for Runway, Pika, Luma, etc.
+Supports: Kling (direct), fal.ai (Kling proxy), and extensible for Runway, Pika, Luma, etc.
 
 Usage:
     from app.services.ai_video import generate_video_from_image, generate_videos_for_scenes
@@ -20,6 +20,8 @@ import time
 import requests
 from typing import List, Optional
 from loguru import logger
+
+import json
 
 from app.config import config
 from app.utils import utils
@@ -287,6 +289,191 @@ def _kling_poll_task(
     return ""
 
 
+# ─── fal.ai Provider ───────────────────────────────────────────────────
+
+def _get_fal_key() -> str:
+    """Get fal.ai API key."""
+    key = config.app.get("fal_key", "").strip()
+    if not key:
+        raise ValueError(
+            "fal.ai key not configured. Set fal_key in config.toml "
+            "(get it at https://fal.ai/dashboard/keys)"
+        )
+    return key
+
+
+def _fal_headers() -> dict:
+    return {"Authorization": f"Key {_get_fal_key()}", "Content-Type": "application/json"}
+
+
+def _fal_submit_and_poll(
+    endpoint: str,
+    payload: dict,
+    save_path: str,
+    max_wait: int = 600,
+    poll_interval: int = 5,
+) -> str:
+    """
+    Submit request to fal.ai queue and poll for result.
+
+    fal.ai pattern:
+      1. POST to queue.fal.run/{endpoint} → get request_id
+      2. Poll queue.fal.run/requests/{request_id}/status → status
+      3. When completed, GET response URL for video
+
+    Returns:
+        Path to downloaded video, or "" on failure
+    """
+    base_url = "https://queue.fal.run"
+    headers = _fal_headers()
+
+    try:
+        # Step 1: Submit
+        logger.info(f"fal.ai submit: {endpoint}")
+        resp = requests.post(
+            f"{base_url}/{endpoint}",
+            headers=headers,
+            json=payload,
+            timeout=(30, 60),
+        )
+        if resp.status_code != 200 and resp.status_code != 201:
+            detail = resp.json().get("detail", "unknown")
+            logger.error(f"fal.ai submit failed: {resp.status_code} {detail}")
+            return ""
+
+        data = resp.json()
+        request_id = data.get("request_id")
+        if not request_id:
+            logger.error(f"fal.ai submit: no request_id in response")
+            return ""
+
+        logger.info(f"fal.ai task created: {request_id}")
+
+        # Step 2: Poll
+        elapsed = 0
+        while elapsed < max_wait:
+            try:
+                status_resp = requests.get(
+                    f"{base_url}/requests/{request_id}/status",
+                    headers=headers,
+                    timeout=30,
+                )
+                if status_resp.status_code != 200:
+                    time.sleep(poll_interval)
+                    elapsed += poll_interval
+                    continue
+
+                status_data = status_resp.json()
+                status = status_data.get("status", "")
+
+                logger.info(f"fal.ai {request_id}: {status} ({elapsed}s)")
+
+                if status == "COMPLETED":
+                    # Get the response
+                    resp_get = requests.get(
+                        f"{base_url}/requests/{request_id}",
+                        headers=headers,
+                        timeout=30,
+                    )
+                    if resp_get.status_code != 200:
+                        logger.error("fal.ai: completed but failed to get response")
+                        return ""
+
+                    result = resp_get.json()
+                    # fal.ai wraps results based on endpoint
+                    video_url = _extract_fal_video_url(result, endpoint)
+                    if video_url:
+                        return _download_video(video_url, save_path)
+                    logger.error(f"fal.ai: completed but no video URL in response")
+                    return ""
+
+                elif status in ("FAILED", "ERROR"):
+                    err = status_data.get("error", "unknown")
+                    logger.error(f"fal.ai task failed: {err}")
+                    return ""
+
+                # Still processing
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+
+            except Exception as e:
+                logger.warning(f"fal.ai poll error: {e}")
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+
+        logger.error(f"fal.ai task timed out after {max_wait}s")
+        return ""
+
+    except Exception as e:
+        logger.error(f"fal.ai request failed: {e}")
+        return ""
+
+
+def _extract_fal_video_url(result: dict, endpoint: str) -> str:
+    """Extract video URL from fal.ai response, handles different endpoint formats."""
+    # Many fal.ai endpoints return {video: {url: ...}} or {video: {url: {url: ...}}}
+    if endpoint.startswith("fal-ai/kling"):
+        video = result.get("video", {})
+        if isinstance(video, dict):
+            url = video.get("url", "")
+            if isinstance(url, dict):
+                url = url.get("url", "")
+            return url
+        return ""
+    # General fallback
+    for key in ["video", "output", "result"]:
+        item = result.get(key, {})
+        if isinstance(item, dict):
+            url = item.get("url", "")
+            if url:
+                return url
+    return ""
+
+
+def fal_image_to_video(
+    image_path: str,
+    prompt: str,
+    save_path: str,
+    duration: int = 5,
+    model: str = "kling-v2",
+) -> str:
+    """
+    Generate video using fal.ai.
+
+    Uses Kling model on fal.ai platform.
+    Available Kling models on fal.ai:
+      - fal-ai/kling-video/v1.6/standard/image-to-video
+      - fal-ai/kling-video/v1.6/pro/image-to-video
+    """
+    import base64 as b64
+
+    # Upload image to a hosted URL first, or use base64 via fal's built-in support
+    with open(image_path, "rb") as f:
+        img_data = b64.b64encode(f.read()).decode("utf-8")
+
+    ext = os.path.splitext(image_path)[1].lstrip(".")
+    mime = f"image/{ext}" if ext else "image/png"
+    data_uri = f"data:{mime};base64,{img_data}"
+
+    # Map model name to fal.ai endpoint
+    model_map = {
+        "kling-std": "fal-ai/kling-video/v2.1/standard/image-to-video",
+        "kling-pro": "fal-ai/kling-video/v2.1/pro/image-to-video",
+        "kling-master": "fal-ai/kling-video/v2.1/master/image-to-video",
+    }
+
+    model_key = config.app.get("fal_kling_model", model)
+    endpoint = model_map.get(model_key, model_map["kling-std"])
+
+    payload = {
+        "image_url": data_uri,
+        "prompt": prompt[:500],
+        "duration": str(duration),
+    }
+
+    return _fal_submit_and_poll(endpoint, payload, save_path)
+
+
 # ─── Public API ────────────────────────────────────────────────────────
 
 def generate_video_from_image(
@@ -308,7 +495,7 @@ def generate_video_from_image(
         duration: Target duration (5 or 10 seconds for Kling)
         mode: Quality mode ("std" or "pro")
         aspect_ratio: "9:16", "16:9", "1:1"
-        provider: Override provider ("kling", "runway", "pika")
+        provider: Override provider ("kling", "fal", "runway", "pika")
 
     Returns:
         Path to saved video, or empty string on failure
@@ -317,6 +504,8 @@ def generate_video_from_image(
 
     if provider == "kling":
         return kling_image_to_video(image_path, prompt, save_path, duration, mode, aspect_ratio)
+    elif provider == "fal":
+        return fal_image_to_video(image_path, prompt, save_path, duration)
     elif provider == "runway":
         # TODO: implement Runway provider
         logger.error("Runway provider not yet implemented")

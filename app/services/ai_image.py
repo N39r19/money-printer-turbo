@@ -2,7 +2,7 @@
 AI Image Generation Service
 
 Provider abstraction for generating images from text prompts.
-Supports: Pollinations (free), DALL-E, Flux, and extensible for more.
+Supports: Pollinations (free), DALL-E, fal.ai (Flux), and extensible for more.
 
 Usage:
     from app.services.ai_image import generate_image, generate_images_for_scenes
@@ -119,6 +119,102 @@ def generate_image_dalle(
     return ""
 
 
+def generate_image_fal(
+    prompt: str,
+    save_path: str,
+    width: int = 1080,
+    height: int = 1920,
+) -> str:
+    """
+    Generate image using fal.ai (has Flux models starting at $0.003/image).
+    Uses fal-ai/flux/schnell by default (cheapest).
+    """
+    fal_key = config.app.get("fal_key", "").strip()
+    if not fal_key:
+        logger.warning("fal_key not configured, falling back to pollinations")
+        return generate_image_pollinations(prompt, save_path, width, height)
+
+    headers = {
+        "Authorization": f"Key {fal_key}",
+        "Content-Type": "application/json",
+    }
+
+    # Map dimensions to size
+    aspect = width / height
+    if abs(aspect - 9/16) < 0.1 or abs(aspect - 16/9) < 0.1:
+        image_size = "portrait_16_9" if height > width else "landscape_16_9"
+    else:
+        image_size = "square_hd"
+
+    payload = {
+        "prompt": prompt[:1000],
+        "image_size": image_size,
+        "num_images": 1,
+        "enable_safety_checker": False,
+    }
+
+    model = config.app.get("fal_image_model", "fal-ai/flux/schnell")
+
+    try:
+        logger.info(f"fal.ai image: {model}")
+        resp = requests.post(
+            f"https://queue.fal.run/{model}",
+            headers=headers,
+            json=payload,
+            timeout=(30, 120),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # fal.ai returns images in different formats
+        images = data.get("images", [])
+        if images:
+            # {url: ..., content_type: ...}
+            img_url = images[0].get("url", "")
+            if not img_url:
+                img_url = images[0] if isinstance(images[0], str) else ""
+        else:
+            # Maybe under {image: {url: ...}} or {output: {url: ...}}
+            img_url = _extract_fal_image_url(data)
+
+        if not img_url:
+            logger.error(f"fal.ai: no image URL in response")
+            return ""
+
+        # Download the image
+        img_resp = requests.get(img_url, timeout=(30, 120))
+        img_resp.raise_for_status()
+        with open(save_path, "wb") as f:
+            f.write(img_resp.content)
+        logger.info(f"fal.ai image saved: {save_path}")
+        return save_path
+
+    except requests.exceptions.HTTPError as e:
+        err_text = resp.text[:200] if hasattr(resp, "text") else str(e)
+        if "balance" in err_text.lower() or "locked" in err_text.lower():
+            logger.warning(f"fal.ai balance exhausted, falling back to pollinations")
+            return generate_image_pollinations(prompt, save_path, width, height)
+        logger.error(f"fal.ai image generation failed: {e} - {err_text}")
+        return ""
+    except Exception as e:
+        logger.error(f"fal.ai image generation failed: {e}")
+        return ""
+
+
+def _extract_fal_image_url(data: dict) -> str:
+    """Extract image URL from fal.ai response."""
+    for key in ["image", "output", "result"]:
+        item = data.get(key, {})
+        if isinstance(item, dict):
+            url = item.get("url", "")
+            if url:
+                return url
+            nested = item.get("image", {}).get("url", "")
+            if nested:
+                return nested
+    return ""
+
+
 def generate_image(
     prompt: str,
     save_path: str,
@@ -134,7 +230,7 @@ def generate_image(
         save_path: Where to save the image file
         width: Image width in pixels
         height: Image height in pixels
-        provider: Override provider ("pollinations", "dalle")
+        provider: Override provider ("pollinations", "dalle", "fal")
 
     Returns:
         Path to saved image, or empty string on failure
@@ -147,6 +243,8 @@ def generate_image(
         # DALL-E sizes: 1024x1024, 1792x1024, 1024x1792
         size = "1024x1792" if height > width else "1792x1024"
         return generate_image_dalle(prompt, save_path, size=size)
+    elif provider == "fal":
+        return generate_image_fal(prompt, save_path, width, height)
     else:
         logger.error(f"unknown ai_image provider: {provider}")
         return ""

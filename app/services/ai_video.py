@@ -8,14 +8,13 @@ Usage:
     from app.services.ai_video import generate_video_from_image, generate_videos_for_scenes
     video_path = generate_video_from_image(image_path, prompt, save_dir="/tmp/videos")
 
-Kling API flow:
-    1. Auth: JWT (HS256) with access_key + secret_key from klingai.com
+Kling API flow (simplified Bearer auth):
+    1. Auth: Bearer <api-key> (from kling.ai/dev/api-key)
     2. POST /v1/videos/image2video → returns task_id
     3. Poll GET /v1/videos/image2video/{task_id} → wait for completion
     4. Download result video
 """
 
-import jwt
 import os
 import time
 import requests
@@ -24,37 +23,6 @@ from loguru import logger
 
 from app.config import config
 from app.utils import utils
-
-
-# ─── Auth ──────────────────────────────────────────────────────────────
-
-def _generate_kling_jwt(access_key: str, secret_key: str) -> str:
-    """Generate JWT token for Kling API authentication."""
-    now = int(time.time())
-    payload = {
-        "iss": access_key,
-        "exp": now + 1800,  # 30 minutes
-        "nbf": now - 5,
-    }
-    token = jwt.encode(payload, secret_key, algorithm="HS256")
-    return token
-
-
-def _get_kling_auth_header() -> dict:
-    """Build auth header for Kling API."""
-    access_key = config.app.get("kling_access_key", "")
-    secret_key = config.app.get("kling_secret_key", "")
-
-    if not access_key or not secret_key:
-        raise ValueError(
-            "Kling API keys not configured. Set kling_access_key and kling_secret_key in config.toml"
-        )
-
-    token = _generate_kling_jwt(access_key, secret_key)
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────
@@ -67,6 +35,30 @@ def _get_provider() -> str:
 def _get_kling_base_url() -> str:
     """Get Kling API base URL."""
     return config.app.get("kling_base_url", "https://api.klingai.com").rstrip("/")
+
+
+def _get_kling_api_key() -> str:
+    """Get Kling API key from config."""
+    api_key = config.app.get("kling_api_key", "").strip()
+    if not api_key:
+        # Fallback to access_key/secret_key for backward compat
+        access_key = config.app.get("kling_access_key", "").strip()
+        if access_key:
+            return access_key
+        raise ValueError(
+            "Kling API key not configured. Set kling_api_key in config.toml "
+            "(get it at https://kling.ai/dev/api-key)"
+        )
+    return api_key
+
+
+def _get_kling_headers() -> dict:
+    """Build auth header for Kling API (simple Bearer token)."""
+    api_key = _get_kling_api_key()
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
 
 
 def _get_save_dir(task_id: str) -> str:
@@ -130,7 +122,7 @@ def kling_image_to_video(
         Path to saved video, or empty string on failure
     """
     base_url = _get_kling_base_url()
-    headers = _get_kling_auth_header()
+    headers = _get_kling_headers()
 
     # Convert image to base64
     image_b64 = _image_to_base64(image_path)
@@ -143,11 +135,10 @@ def kling_image_to_video(
         "negative_prompt": "",
         "duration": duration,
         "mode": mode,
-        "aspect_ratio": aspect_ratio,
     }
 
     try:
-        logger.info(f"kling image2video: prompt='{prompt[:60]}...', duration={duration}s")
+        logger.info(f"kling image2video: prompt='{prompt[:60]}...', duration={duration}s, mode={mode}")
         resp = requests.post(
             f"{base_url}/v1/videos/image2video",
             headers=headers,
@@ -158,14 +149,14 @@ def kling_image_to_video(
         data = resp.json()
 
         if data.get("code") != 0:
-            logger.error(f"kling API error: {data.get('message', 'unknown')}")
+            logger.error(f"kling API error: code={data.get('code')}, message={data.get('message', 'unknown')}")
             return ""
 
         task_id = data["data"]["task_id"]
         logger.info(f"kling task created: {task_id}")
 
         # Poll for completion
-        video_url = _kling_poll_task(task_id, headers, base_url)
+        video_url = _kling_poll_task(task_id, headers, base_url, "image2video")
         if not video_url:
             return ""
 
@@ -188,7 +179,7 @@ def kling_text_to_video(
     Generate video from text prompt using Kling API.
     """
     base_url = _get_kling_base_url()
-    headers = _get_kling_auth_header()
+    headers = _get_kling_headers()
 
     payload = {
         "model_name": config.app.get("kling_model_name", "kling-v3"),
@@ -211,13 +202,13 @@ def kling_text_to_video(
         data = resp.json()
 
         if data.get("code") != 0:
-            logger.error(f"kling API error: {data.get('message', 'unknown')}")
+            logger.error(f"kling API error: code={data.get('code')}, message={data.get('message')}")
             return ""
 
         task_id = data["data"]["task_id"]
         logger.info(f"kling task created: {task_id}")
 
-        video_url = _kling_poll_task(task_id, headers, base_url)
+        video_url = _kling_poll_task(task_id, headers, base_url, "text2video")
         if not video_url:
             return ""
 
@@ -232,6 +223,7 @@ def _kling_poll_task(
     task_id: str,
     headers: dict,
     base_url: str,
+    endpoint: str = "image2video",
     max_wait: int = 600,
     interval: int = 10,
 ) -> str:
@@ -242,6 +234,7 @@ def _kling_poll_task(
         task_id: Kling task ID
         headers: Auth headers
         base_url: API base URL
+        endpoint: "image2video" or "text2video"
         max_wait: Maximum wait time in seconds
         interval: Poll interval in seconds
 
@@ -252,7 +245,7 @@ def _kling_poll_task(
     while elapsed < max_wait:
         try:
             resp = requests.get(
-                f"{base_url}/v1/videos/image2video/{task_id}",
+                f"{base_url}/v1/videos/{endpoint}/{task_id}",
                 headers=headers,
                 timeout=(30, 60),
             )
@@ -260,7 +253,7 @@ def _kling_poll_task(
             data = resp.json()
 
             if data.get("code") != 0:
-                logger.error(f"kling query error: {data.get('message')}")
+                logger.error(f"kling query error: code={data.get('code')}, message={data.get('message')}")
                 return ""
 
             task_data = data.get("data", {})
